@@ -10,7 +10,7 @@ def filter_hard_problems(dataset: Dataset, n: int = 1200) -> Dataset:
 
 
 def format_for_training(example: dict) -> dict:
-    """Convert a DeepMath-103K row into GRPOTrainer conversational format.
+    """Convert a DeepMath-103K row into conversational training format.
 
     Returns a dict with 'prompt' (list of message dicts) and 'final_answer'.
     """

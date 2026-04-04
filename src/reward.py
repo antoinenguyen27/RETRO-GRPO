@@ -77,8 +77,24 @@ def is_equivalent(predicted: str, ground_truth: str) -> bool:
     return False
 
 
+def score_completion_texts(
+    completions: list[str], final_answers: list[str]
+) -> list[float]:
+    """Score completion texts against deterministic math answers."""
+    rewards = []
+    for completion, gt in zip(completions, final_answers):
+        pred = extract_boxed_answer(completion)
+        if pred is not None and is_equivalent(
+            normalize_answer(pred), normalize_answer(gt)
+        ):
+            rewards.append(1.0)
+        else:
+            rewards.append(0.0)
+    return rewards
+
+
 def accuracy_reward(completions, final_answer, **kwargs) -> list[float]:
-    """TRL-compatible reward function for deterministic math answer verification.
+    """Compatibility wrapper for deterministic math answer verification.
 
     Args:
         completions: List of completion strings or message dicts.
@@ -95,11 +111,5 @@ def accuracy_reward(completions, final_answer, **kwargs) -> list[float]:
         else:
             text = completion
 
-        pred = extract_boxed_answer(text)
-        if pred is not None and is_equivalent(
-            normalize_answer(pred), normalize_answer(gt)
-        ):
-            rewards.append(1.0)
-        else:
-            rewards.append(0.0)
+        rewards.append(score_completion_texts([text], [gt])[0])
     return rewards

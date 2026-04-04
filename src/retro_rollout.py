@@ -1,234 +1,235 @@
-"""Custom rollout function for RETRO-GRPO two-phase pipeline.
+"""Custom rollout engines for baseline GRPO and RETRO-GRPO."""
 
-Implements the in-step scout → summarise → conditioned-generation pipeline
-via TRL's experimental rollout_func API.
-"""
+from dataclasses import dataclass, field
 
 import torch
-import torch.nn.functional as F
 
-from src.reward import extract_boxed_answer, is_equivalent, normalize_answer
+from src.config import Stage1Config
+from src.reward import score_completion_texts
 from src.summariser import (
+    FailureSummaryRequest,
     build_conditioned_prompt,
-    generate_summary,
+    generate_failure_summaries,
     wrap_in_framing,
 )
+from src.token_utils import truncate_from_left
 
 
-def _compute_logprobs_batched(
-    scores: tuple[torch.Tensor, ...], sequences: torch.Tensor, prompt_len: int
-) -> list[list[float]]:
-    """Compute per-token logprobs for a batch of sequences.
-
-    Args:
-        scores: Tuple of score tensors, one per generated step.
-                Each shape: (batch_size, vocab_size).
-        sequences: Full sequences tensor (batch_size, seq_len).
-        prompt_len: Length of the prompt (shared across the batch).
-
-    Returns:
-        List of lists of logprobs, one inner list per sequence in the batch.
-    """
-    batch_size = sequences.shape[0]
-    all_logprobs: list[list[float]] = [[] for _ in range(batch_size)]
-
-    for step_idx, step_scores in enumerate(scores):
-        step_log_probs = F.log_softmax(step_scores, dim=-1)  # (batch, vocab)
-        token_pos = prompt_len + step_idx
-        if token_pos >= sequences.shape[1]:
-            break
-        for b in range(batch_size):
-            tid = sequences[b, token_pos].item()
-            all_logprobs[b].append(step_log_probs[b, tid].item())
-
-    return all_logprobs
+@dataclass(slots=True)
+class RolloutBatch:
+    sequences: list[list[int]]
+    prompt_lengths: list[int]
+    completion_ids: list[list[int]]
+    completion_texts: list[str]
+    rewards: list[float]
+    group_ids: list[int]
+    truncated: list[bool]
+    metrics: dict[str, float] = field(default_factory=dict)
 
 
-def _score_completions(texts: list[str], ground_truth: str) -> list[float]:
-    """Score completions against ground truth. Returns list of 0.0/1.0."""
-    rewards = []
-    for text in texts:
-        pred = extract_boxed_answer(text)
-        if pred is not None and is_equivalent(
-            normalize_answer(pred), normalize_answer(ground_truth)
-        ):
-            rewards.append(1.0)
-        else:
-            rewards.append(0.0)
-    return rewards
+def _trim_completion_ids(
+    token_ids: list[int],
+    eos_token_id: int | None,
+    pad_token_id: int | None,
+) -> tuple[list[int], bool]:
+    if eos_token_id is not None and eos_token_id in token_ids:
+        eos_index = token_ids.index(eos_token_id)
+        return token_ids[: eos_index + 1], False
+
+    if pad_token_id is not None and pad_token_id != eos_token_id:
+        while token_ids and token_ids[-1] == pad_token_id:
+            token_ids.pop()
+
+    return token_ids, True
 
 
 @torch.no_grad()
-def retro_grpo_rollout(prompts: list, trainer) -> dict:
-    """Two-phase rollout for RETRO-GRPO.
-
-    For each prompt:
-      1. Generate N scout rollouts (unconditioned)
-      2. Score scouts with deterministic verification
-      3. Summarise each failed scout, then aggregate into one descriptive
-         narrative
-      4. Generate N conditioned rollouts (summary prepended to prompt)
-      5. Return conditioned rollouts (prompt_ids, completion_ids, logprobs)
-
-    The scouts are discarded after summarisation — only conditioned rollouts
-    enter the GRPO gradient computation.
-
-    Args:
-        prompts: List of prompt message lists allocated to this process.
-                 Each element is a list of message dicts (conversational format).
-        trainer: The GRPOTrainer instance (provides model, tokenizer, config).
-
-    Returns:
-        Dict with keys: prompt_ids, completion_ids, logprobs, final_answer.
-    """
-    model = trainer.model
-    tokenizer = trainer.processing_class
-    num_gen = trainer.args.num_generations
-    max_new_tokens = trainer.args.max_completion_length
-    rollout_summary_max_new_tokens = getattr(
-        trainer.args, "rollout_summary_max_new_tokens", 384
-    )
-    aggregate_summary_max_new_tokens = getattr(
-        trainer.args, "aggregate_summary_max_new_tokens", 512
-    )
-
-    all_prompt_ids: list[list[int]] = []
-    all_completion_ids: list[list[int]] = []
-    all_logprobs: list[list[float]] = []
-    all_final_answers: list[str] = []
-
-    # RETRO-GRPO custom metrics accumulators
-    total_scout_correct = 0
-    total_scout_count = 0
-    total_cond_correct = 0
-    total_cond_count = 0
-
-    # Answer lookup is attached to the trainer by train.py
-    answer_lookup = trainer._retro_answer_lookup
-
-    for prompt_messages in prompts:
-        question = prompt_messages[-1]["content"]
-
-        # --- Phase 1: Scout generation (unconditioned) ---
-        scout_input_ids = tokenizer.apply_chat_template(
-            prompt_messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        ).to(model.device)
-
-        scout_outputs = model.generate(
-            input_ids=scout_input_ids.expand(num_gen, -1),
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=1.0,
-            return_dict_in_generate=True,
+def _generate_policy_rollouts(
+    model,
+    tokenizer,
+    prompt_messages_batch: list[list[dict]],
+    answers: list[str],
+    config: Stage1Config,
+    label: str,
+) -> RolloutBatch:
+    max_prompt_tokens = max(config.max_seq_length - config.max_completion_length, 1)
+    prompt_token_lists = [
+        truncate_from_left(
+            tokenizer.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                enable_thinking=config.rollout_enable_thinking,
+            ),
+            max_prompt_tokens,
         )
-        prompt_len = scout_input_ids.shape[1]
-        scout_comp_ids = scout_outputs.sequences[:, prompt_len:]
-        scout_texts = tokenizer.batch_decode(scout_comp_ids, skip_special_tokens=True)
+        for messages in prompt_messages_batch
+    ]
+    model_inputs = tokenizer.pad(
+        {"input_ids": prompt_token_lists},
+        padding=True,
+        return_tensors="pt",
+    ).to(model.device)
 
-        # --- Phase 2: Score scouts ---
-        gt = answer_lookup[question]
-        scout_rewards = _score_completions(scout_texts, gt)
-        total_scout_correct += sum(scout_rewards)
-        total_scout_count += len(scout_rewards)
+    expanded_input_ids = model_inputs["input_ids"].repeat_interleave(
+        config.num_generations, dim=0
+    )
+    expanded_attention_mask = model_inputs["attention_mask"].repeat_interleave(
+        config.num_generations, dim=0
+    )
 
-        failed_scouts = [
-            t for t, r in zip(scout_texts, scout_rewards) if r == 0.0
-        ]
+    outputs = model.generate(
+        input_ids=expanded_input_ids,
+        attention_mask=expanded_attention_mask,
+        max_new_tokens=config.max_completion_length,
+        do_sample=True,
+        temperature=config.rollout_temperature,
+        top_p=config.rollout_top_p,
+        top_k=config.rollout_top_k,
+        min_p=config.rollout_min_p,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
 
-        # --- Phase 3: Summarise failures ---
-        if failed_scouts:
-            summary = generate_summary(
-                model,
-                tokenizer,
-                question,
-                failed_scouts,
-                rollout_summary_max_new_tokens=rollout_summary_max_new_tokens,
-                aggregate_summary_max_new_tokens=aggregate_summary_max_new_tokens,
+    padded_prompt_length = expanded_input_ids.shape[1]
+    sequences: list[list[int]] = []
+    prompt_lengths: list[int] = []
+    completion_ids: list[list[int]] = []
+    completion_texts: list[str] = []
+    group_ids: list[int] = []
+    truncated: list[bool] = []
+
+    for seq_idx in range(outputs.shape[0]):
+        prompt_idx = seq_idx // config.num_generations
+        prompt_ids = prompt_token_lists[prompt_idx]
+        raw_completion_ids = outputs[seq_idx, padded_prompt_length:].tolist()
+        trimmed_completion_ids, is_truncated = _trim_completion_ids(
+            raw_completion_ids,
+            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+        sequences.append(prompt_ids + trimmed_completion_ids)
+        prompt_lengths.append(len(prompt_ids))
+        completion_ids.append(trimmed_completion_ids)
+        completion_texts.append(
+            tokenizer.decode(trimmed_completion_ids, skip_special_tokens=True).strip()
+        )
+        group_ids.append(prompt_idx)
+        truncated.append(is_truncated)
+
+    repeated_answers = [answers[group_id] for group_id in group_ids]
+    rewards = score_completion_texts(completion_texts, repeated_answers)
+    completion_lengths = [len(ids) for ids in completion_ids]
+
+    metrics = {
+        f"{label}_correct": float(sum(rewards)),
+        f"{label}_count": float(len(rewards)),
+        f"{label}_truncated": float(sum(1 for item in truncated if item)),
+        f"{label}_completion_tokens": float(sum(completion_lengths)),
+    }
+
+    return RolloutBatch(
+        sequences=sequences,
+        prompt_lengths=prompt_lengths,
+        completion_ids=completion_ids,
+        completion_texts=completion_texts,
+        rewards=rewards,
+        group_ids=group_ids,
+        truncated=truncated,
+        metrics=metrics,
+    )
+
+
+@torch.no_grad()
+def run_baseline_rollouts(
+    model,
+    tokenizer,
+    prompt_messages_batch: list[list[dict]],
+    answers: list[str],
+    config: Stage1Config,
+) -> RolloutBatch:
+    """Generate the standard GRPO completion groups."""
+    return _generate_policy_rollouts(
+        model=model,
+        tokenizer=tokenizer,
+        prompt_messages_batch=prompt_messages_batch,
+        answers=answers,
+        config=config,
+        label="baseline",
+    )
+
+
+@torch.no_grad()
+def run_retro_rollouts(
+    model,
+    tokenizer,
+    prompt_messages_batch: list[list[dict]],
+    answers: list[str],
+    config: Stage1Config,
+) -> RolloutBatch:
+    """Generate RETRO scout rollouts, summaries, and conditioned rollouts."""
+    scout_batch = _generate_policy_rollouts(
+        model=model,
+        tokenizer=tokenizer,
+        prompt_messages_batch=prompt_messages_batch,
+        answers=answers,
+        config=config,
+        label="retro_scout",
+    )
+
+    requests: list[FailureSummaryRequest] = []
+    for prompt_idx, prompt_messages in enumerate(prompt_messages_batch):
+        failed_rollouts = [
+            completion_text
+            for completion_text, reward, group_id in zip(
+                scout_batch.completion_texts,
+                scout_batch.rewards,
+                scout_batch.group_ids,
             )
-            failure_context = wrap_in_framing(summary)
-            conditioned_messages = build_conditioned_prompt(
-                prompt_messages, failure_context
+            if group_id == prompt_idx and reward == 0.0
+        ]
+        requests.append(
+            FailureSummaryRequest(
+                question=prompt_messages[-1]["content"],
+                failed_rollouts=failed_rollouts,
+            )
+        )
+
+    summaries = generate_failure_summaries(
+        model=model,
+        tokenizer=tokenizer,
+        requests=requests,
+        rollout_summary_max_new_tokens=config.rollout_summary_max_new_tokens,
+        aggregate_summary_max_new_tokens=config.aggregate_summary_max_new_tokens,
+        enable_thinking=config.summary_enable_thinking,
+        do_sample=config.summary_do_sample,
+        summariser_mode=config.summariser_mode,
+        max_seq_length=config.max_seq_length,
+    )
+
+    conditioned_messages_batch: list[list[dict]] = []
+    conditioned_prompt_count = 0
+    for prompt_messages, summary in zip(prompt_messages_batch, summaries):
+        if summary:
+            conditioned_prompt_count += 1
+            conditioned_messages_batch.append(
+                build_conditioned_prompt(prompt_messages, wrap_in_framing(summary))
             )
         else:
-            # All scouts correct (rare on hard problems) — skip conditioning
-            conditioned_messages = prompt_messages
+            conditioned_messages_batch.append(prompt_messages)
 
-        # --- Phase 4: Conditioned generation ---
-        cond_input_ids = tokenizer.apply_chat_template(
-            conditioned_messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        ).to(model.device)
-
-        cond_outputs = model.generate(
-            input_ids=cond_input_ids.expand(num_gen, -1),
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=1.0,
-            output_scores=True,
-            return_dict_in_generate=True,
-        )
-
-        cond_prompt_len = cond_input_ids.shape[1]
-        cond_sequences = cond_outputs.sequences
-
-        # Compute logprobs for each conditioned completion
-        batch_logprobs = _compute_logprobs_batched(
-            cond_outputs.scores, cond_sequences, cond_prompt_len
-        )
-
-        # Collect conditioned results
-        cond_prompt_ids_list = cond_input_ids[0].tolist()
-        for seq_idx in range(num_gen):
-            comp_ids = cond_sequences[seq_idx, cond_prompt_len:].tolist()
-            # Trim trailing pad tokens
-            if tokenizer.pad_token_id is not None:
-                while comp_ids and comp_ids[-1] == tokenizer.pad_token_id:
-                    comp_ids.pop()
-            all_prompt_ids.append(cond_prompt_ids_list)
-            all_completion_ids.append(comp_ids)
-            all_logprobs.append(batch_logprobs[seq_idx][: len(comp_ids)])
-            all_final_answers.append(gt)
-
-        # Track conditioned solve rate
-        cond_texts = tokenizer.batch_decode(
-            cond_sequences[:, cond_prompt_len:], skip_special_tokens=True
-        )
-        cond_rewards = _score_completions(cond_texts, gt)
-        total_cond_correct += sum(cond_rewards)
-        total_cond_count += len(cond_rewards)
-
-    # Log RETRO-specific metrics if W&B is available
-    try:
-        import wandb
-
-        if wandb.run is not None:
-            wandb.log(
-                {
-                    "retro/scout_solve_rate": (
-                        total_scout_correct / total_scout_count
-                        if total_scout_count > 0
-                        else 0.0
-                    ),
-                    "retro/conditioned_solve_rate": (
-                        total_cond_correct / total_cond_count
-                        if total_cond_count > 0
-                        else 0.0
-                    ),
-                    "retro/conditioning_rate": 1.0,  # Stage 1: always conditioned
-                },
-                commit=False,
-            )
-    except ImportError:
-        pass
-
-    return {
-        "prompt_ids": all_prompt_ids,
-        "completion_ids": all_completion_ids,
-        "logprobs": all_logprobs,
-        "final_answer": all_final_answers,
-    }
+    conditioned_batch = _generate_policy_rollouts(
+        model=model,
+        tokenizer=tokenizer,
+        prompt_messages_batch=conditioned_messages_batch,
+        answers=answers,
+        config=config,
+        label="retro_conditioned",
+    )
+    conditioned_batch.metrics.update(scout_batch.metrics)
+    conditioned_batch.metrics["retro_summary_prompt_count"] = float(
+        conditioned_prompt_count
+    )
+    conditioned_batch.metrics["retro_prompt_count"] = float(len(prompt_messages_batch))
+    return conditioned_batch

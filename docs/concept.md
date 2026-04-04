@@ -148,7 +148,8 @@ The method modifies the rollout generation phase of standard GRPO training using
    - Compute advantages across the N conditioned rollouts ONLY
    - Scouts are excluded from the gradient computation (they served as
      diagnostic input for the summariser)
-   - Apply standard GRPO policy gradient with clipping and KL penalty
+   - Apply a standard GRPO-style policy gradient with clipping; KL is optional
+     and is disabled in the stage-1 PoC (`beta = 0.0`)
    - Update rolling solve rate for prompt x
 ```
 
@@ -358,10 +359,12 @@ The original research configuration assumes larger benchmark suites, larger mode
 ### 6.2 PoC Default Configuration
 
 **Model and stack**
-- Qwen3.5-4B
-- bf16 LoRA via Unsloth
+- Qwen3-8B
+- bf16 LoRA via a custom `transformers + peft + accelerate` stack
 - LoRA rank 32
 - L4 as the default Modal GPU
+- Qwen3 rollouts use thinking mode; summary generation disables thinking
+- custom GRPO loss module with default `scale_rewards = "group"` and `loss_type = "dapo"`
 
 **Training data**
 - DeepMath-103K
@@ -373,9 +376,12 @@ The original research configuration assumes larger benchmark suites, larger mode
 - stage 1: MATH-500 only
 
 **Generation and batching**
+- per-device prompt slots: 3
+- gradient accumulation steps: 4
 - rollouts per phase: N = 4
 - max completion length: 1024 tokens
-- effective batch size: 12
+- effective prompt batch size: 12
+- effective conditioned completions per optimizer step: 48
 - target unique prompts per generation cycle: 3
 - stage-1 optimizer steps: 300 (1,200 problems × 3 epochs / batch 12)
 
@@ -420,7 +426,8 @@ The added logic is:
 - deterministic scout scoring,
 - summarisation for every prompt routed into the RETRO-GRPO path using that prompt's failed scouts,
 - batched conditioned rollout generation for those prompts,
-- batch assembly before the standard GRPO update.
+- batch assembly before the local GRPO update,
+- modular reward scaling and loss reduction so GRPO, DAPO, and Dr.GRPO stay swappable.
 
 This is the minimal implementation needed to answer the first-order mechanism question.
 
