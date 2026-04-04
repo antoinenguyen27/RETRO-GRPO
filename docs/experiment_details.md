@@ -91,14 +91,14 @@ This is the default operational model for the PoC. We do not discuss fallback mo
 
 ### Compute
 
-**Modal L4** by default.
+**Modal L40S** by default.
 
-This is the default GPU for the PoC. If smoke tests show that Qwen3-8B plus the two-phase rollout path does not fit comfortably on an L4, the fallback is to move to **L40S** only after that failure is observed.
+The current operational default uses **L40S** so the stage-1 runtime can support the larger physical microbatch and the long-sequence GRPO logprob path with headroom.
 
 Reasoning:
 - single-GPU operation keeps the custom trainer simple,
-- the L4 is the default operating point for stage 1,
-- we only pay for a higher-tier GPU if the smoke test proves it necessary.
+- the L40S gives enough VRAM headroom for the current 8B trainer and `6x2` batch layout,
+- it preserves room for longer completions and follow-on batch experiments.
 
 ### Framework
 
@@ -185,15 +185,15 @@ Batch size must be treated explicitly in GRPO.
 
 ### Default stage-1 batching
 
-- `per_device_train_batch_size = 3`
-- `gradient_accumulation_steps = 4`
+- `per_device_train_batch_size = 6`
+- `gradient_accumulation_steps = 2`
 - `num_generations = 4`
 - **effective prompt batch size = 12**
 - **effective conditioned completions per optimizer step = 48**
-- target unique prompts per generation cycle: **3**
+- target unique prompts per generation cycle: **6**
 
-This avoids the too-small effective-batch regime and is cleaner than the earlier implicit batch-8 plan.
-The key accounting unit is prompt groups, not repeated prompt slots. Each microbatch contains `3` prompt groups and `4` rollouts per prompt. Gradient accumulation over `4` microbatches yields `12` prompt groups per optimizer step.
+This keeps the effective prompt batch in the same regime while reducing accumulation overhead.
+The key accounting unit is prompt groups, not repeated prompt slots. Each microbatch contains `6` prompt groups and `4` rollouts per prompt. Gradient accumulation over `2` microbatches yields `12` prompt groups per optimizer step.
 
 ### Stage-1 optimizer-step count
 
@@ -215,15 +215,15 @@ This is the number to use in the operational plan.
 ```python
 stage1_config = {
     "model": "Qwen3-8B",
-    "gpu": "L4",
+    "gpu": "L40S",
     "stack": "transformers_peft_accelerate",
     "finetuning": "bf16_lora",
     "lora_rank": 32,
     "dataset": "DeepMath-103K_hard_filtered_1200",
     "epochs": 3,
     "benchmark": "MATH-500",
-    "per_device_train_batch_size": 3,
-    "gradient_accumulation_steps": 4,
+    "per_device_train_batch_size": 6,
+    "gradient_accumulation_steps": 2,
     "num_generations": 4,
     "effective_prompt_batch_size": 12,
     "effective_conditioned_completions": 48,
@@ -420,4 +420,4 @@ These are no longer stage-1 defaults:
 
 ## 13. Stage-1 Anchor Summary
 
-**Stage 1 uses Qwen3-8B with bf16 LoRA on a custom `transformers + peft + accelerate` stack on an L4, trains baseline GRPO vs RETRO-GRPO on a hard-filtered 1,200-problem DeepMath subset for 3 epochs at effective prompt batch size 12 (300 optimizer steps), evaluates on MATH-500 only, and uses no annealing.**
+**Stage 1 uses Qwen3-8B with bf16 LoRA on a custom `transformers + peft + accelerate` stack on an L40S, trains baseline GRPO vs RETRO-GRPO on a hard-filtered 1,200-problem DeepMath subset for 3 epochs at effective prompt batch size 12 (300 optimizer steps), evaluates on MATH-500 only, and uses no annealing.**

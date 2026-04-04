@@ -3,10 +3,12 @@ import os
 import shutil
 from contextlib import nullcontext
 from dataclasses import dataclass
+from types import MethodType
 
 import torch
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from accelerate.utils.operations import ConvertOutputsToFp32
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from transformers import get_scheduler
@@ -89,6 +91,7 @@ class Stage1Trainer:
         ) = self.accelerator.prepare(
             self.model, self.optimizer, self.train_dataloader, self.scheduler
         )
+        self._disable_output_widening()
 
         if self.accelerator.is_main_process:
             self.accelerator.init_trackers(
@@ -116,6 +119,19 @@ class Stage1Trainer:
             micro_steps_per_epoch / self.config.gradient_accumulation_steps
         )
         return max(optimizer_steps_per_epoch * self.config.num_train_epochs, 1)
+
+    def _disable_output_widening(self) -> None:
+        base_model = self.accelerator.unwrap_model(self.model)
+        wrapped = getattr(base_model.forward, "__wrapped__", None)
+        if wrapped is None:
+            return
+        if not isinstance(wrapped, ConvertOutputsToFp32):
+            return
+
+        autocast_forward = getattr(wrapped, "__wrapped__", None)
+        if autocast_forward is None:
+            raise RuntimeError("Unexpected Accelerate forward wrapper chain.")
+        base_model.forward = MethodType(autocast_forward, base_model)
 
     def _generate_rollout_batch(
         self, unwrapped_model, prompt_batch: list[list[dict]], answers: list[str]
@@ -150,9 +166,10 @@ class Stage1Trainer:
                 pad_token_id=self.tokenizer.pad_token_id,
                 device=self.accelerator.device,
             )
-            old_logprobs, completion_mask = compute_completion_logprobs(
-                unwrapped_model, packed
-            )
+            with torch.no_grad():
+                old_logprobs, completion_mask = compute_completion_logprobs(
+                    unwrapped_model, packed
+                )
 
             if self.config.mask_truncated_completions:
                 truncated_mask = torch.tensor(
@@ -172,7 +189,8 @@ class Stage1Trainer:
                         "beta > 0 requires a PEFT model so the frozen base policy can be used as reference."
                     )
                 with unwrapped_model.disable_adapter():
-                    ref_logprobs, _ = compute_completion_logprobs(unwrapped_model, packed)
+                    with torch.no_grad():
+                        ref_logprobs, _ = compute_completion_logprobs(unwrapped_model, packed)
                 ref_logprobs = torch.where(
                     completion_mask, ref_logprobs, torch.zeros_like(ref_logprobs)
                 )

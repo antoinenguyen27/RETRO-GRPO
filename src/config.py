@@ -1,6 +1,5 @@
 from dataclasses import asdict, dataclass, field
 
-
 SYSTEM_PROMPT = (
     "Solve the following math problem step by step. "
     "Provide your final answer within \\boxed{}."
@@ -35,8 +34,8 @@ class Stage1Config:
 
     # Optimisation
     num_generations: int = 4
-    per_device_train_batch_size: int = 3
-    gradient_accumulation_steps: int = 4
+    per_device_train_batch_size: int = 4
+    gradient_accumulation_steps: int = 3
     num_train_epochs: int = 3
     learning_rate: float = 5e-6
     lr_scheduler_type: str = "linear"
@@ -86,7 +85,7 @@ class Stage1Config:
     save_steps: int = 50
     save_total_limit: int = 3
     dataloader_num_workers: int = 0
-    gpu: str = "L4"
+    gpu: str = "L40S"
     wandb_project: str = "retro-grpo-poc"
 
     @property
