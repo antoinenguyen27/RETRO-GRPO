@@ -65,7 +65,8 @@ def retro_grpo_rollout(prompts: list, trainer) -> dict:
     For each prompt:
       1. Generate N scout rollouts (unconditioned)
       2. Score scouts with deterministic verification
-      3. Summarise the failed scouts into a descriptive narrative
+      3. Summarise each failed scout, then aggregate into one descriptive
+         narrative
       4. Generate N conditioned rollouts (summary prepended to prompt)
       5. Return conditioned rollouts (prompt_ids, completion_ids, logprobs)
 
@@ -84,6 +85,12 @@ def retro_grpo_rollout(prompts: list, trainer) -> dict:
     tokenizer = trainer.processing_class
     num_gen = trainer.args.num_generations
     max_new_tokens = trainer.args.max_completion_length
+    rollout_summary_max_new_tokens = getattr(
+        trainer.args, "rollout_summary_max_new_tokens", 384
+    )
+    aggregate_summary_max_new_tokens = getattr(
+        trainer.args, "aggregate_summary_max_new_tokens", 512
+    )
 
     all_prompt_ids: list[list[int]] = []
     all_completion_ids: list[list[int]] = []
@@ -115,7 +122,6 @@ def retro_grpo_rollout(prompts: list, trainer) -> dict:
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=1.0,
-            output_scores=True,
             return_dict_in_generate=True,
         )
         prompt_len = scout_input_ids.shape[1]
@@ -134,7 +140,14 @@ def retro_grpo_rollout(prompts: list, trainer) -> dict:
 
         # --- Phase 3: Summarise failures ---
         if failed_scouts:
-            summary = generate_summary(model, tokenizer, question, failed_scouts)
+            summary = generate_summary(
+                model,
+                tokenizer,
+                question,
+                failed_scouts,
+                rollout_summary_max_new_tokens=rollout_summary_max_new_tokens,
+                aggregate_summary_max_new_tokens=aggregate_summary_max_new_tokens,
+            )
             failure_context = wrap_in_framing(summary)
             conditioned_messages = build_conditioned_prompt(
                 prompt_messages, failure_context

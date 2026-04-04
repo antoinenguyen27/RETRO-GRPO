@@ -74,14 +74,14 @@ def _get_grpo_config(
     """Build GRPOConfig for stage 1."""
     from trl import GRPOConfig
 
-    return GRPOConfig(
+    config = GRPOConfig(
         output_dir=output_dir,
         run_name=run_name,
         num_generations=4,
         per_device_train_batch_size=3,
         num_train_epochs=num_train_epochs,
         max_steps=max_steps,
-        max_completion_length=512,
+        max_completion_length=1024,
         temperature=1.0,
         learning_rate=5e-6,
         beta=0.001,
@@ -98,6 +98,9 @@ def _get_grpo_config(
         seed=42,
         dataloader_num_workers=0,
     )
+    config.rollout_summary_max_new_tokens = 384
+    config.aggregate_summary_max_new_tokens = 512
+    return config
 
 
 # --------------------------------------------------------------------------- #

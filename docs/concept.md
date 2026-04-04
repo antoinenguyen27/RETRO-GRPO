@@ -115,7 +115,7 @@ On problems where the model genuinely lacks the capability even under conditioni
 
 ### 4.1 Overview
 
-The method modifies the rollout generation phase of standard GRPO training using an in-step two-phase structure following the pattern validated by iGRPO. For prompts where the model's solve rate is below a threshold, a first phase of rollouts ("scouts") are generated, summarised by a lightweight summariser, and the summary is prepended to a second phase of conditioned rollouts. The GRPO advantage computation and gradient update are entirely standard, applied to the conditioned rollouts only.
+The method modifies the rollout generation phase of standard GRPO training using an in-step two-phase structure following the pattern validated by iGRPO. For prompts where the model's solve rate is below a threshold, a first phase of rollouts ("scouts") are generated, summarised by a lightweight two-level summariser, and the summary is prepended to a second phase of conditioned rollouts. The GRPO advantage computation and gradient update are entirely standard, applied to the conditioned rollouts only.
 
 ### 4.2 Training Step (per prompt)
 
@@ -133,8 +133,10 @@ The method modifies the rollout generation phase of standard GRPO training using
    - Compute rewards for scouts
 
 3. Summarise (synchronous, in-step):
-   - Feed the failed scout rollouts to the summariser in a single call
-   - Summariser produces a single narrative summary (3-5 sentences) of
+   - Feed each failed scout rollout to the summariser
+   - Summariser produces one descriptive summary per failed rollout
+   - Feed those rollout summaries to an aggregate summary step
+   - Aggregator produces a single narrative summary (8-12 sentences) of
      approaches tried and how they ended up
    - Wrap summary in a randomly selected framing template
 
@@ -158,19 +160,36 @@ The method modifies the rollout generation phase of standard GRPO training using
 
 The summariser produces a factual narrative of what the failed attempts did. It does NOT diagnose errors, evaluate correctness, or suggest alternatives. It describes approaches and outcomes.
 
-**Summariser prompt (single call over all failed scouts):**
+**First-pass summariser prompt (per failed scout):**
 
 ```
-Summarise the approaches taken across these failed solution attempts in
-3-5 sentences. Describe what was tried and how the attempts ended up.
-Do not evaluate whether any approach was correct or incorrect. Do not
+Summarise the approach taken in this failed solution attempt in
+5-8 sentences. Describe what was tried and how the attempt ended up.
+Do not evaluate whether the approach was correct or incorrect. Do not
 suggest alternatives.
 
 ## Problem
 {problem_text}
 
-## Failed Attempts
-{all_failed_scout_rollouts}
+## Failed Attempt
+{failed_scout_rollout}
+
+Summary of approach tried:
+```
+
+**Aggregate summariser prompt (over rollout summaries):**
+
+```
+Summarise the approaches taken across these failed solution-attempt
+summaries in 8-12 sentences. Describe what was tried and how the attempts
+ended up. Do not evaluate whether any approach was correct or incorrect.
+Do not suggest alternatives.
+
+## Problem
+{problem_text}
+
+## Failed Attempt Summaries
+{failed_scout_rollout_summaries}
 
 Summary of approaches tried:
 ```
@@ -179,7 +198,7 @@ Summary of approaches tried:
 
 **Example output (agentic, τ-bench):** "The agent consistently retrieved the order details first, then attempted to process a refund immediately. Most attempts skipped the return eligibility check entirely. One attempt did call check_return_policy but proceeded with the refund before the response was incorporated into the decision. All attempts ended with the refund either rejected by the system or applied incorrectly."
 
-**Scaling to large k:** When N is large enough that all scout rollouts exceed the summariser's context window, sample a subset of 16-20 rollouts selected mechanically for diversity (longest, shortest, and random from the middle). The summariser still produces the same fixed-size 3-5 sentence output. The sampling is a pre-filter for context limits, not a judgment call.
+**Scaling to large k:** The default scaling path is hierarchical summarisation: summarise each failed rollout first, then aggregate those rollout summaries. Subset sampling is fallback-only if a single rollout or an unusually large summary set still exceeds the summariser's context window.
 
 **Model choice — configurable with default:**
 
@@ -355,14 +374,14 @@ The original research configuration assumes larger benchmark suites, larger mode
 
 **Generation and batching**
 - rollouts per phase: N = 4
-- max completion length: 512 tokens
+- max completion length: 1024 tokens
 - effective batch size: 12
 - target unique prompts per generation cycle: 3
 - stage-1 optimizer steps: 300 (1,200 problems × 3 epochs / batch 12)
 
 **Pipeline**
 - in-step two-phase generation
-- training-policy summariser
+- training-policy hierarchical summariser
 - framing randomisation retained
 - no annealing in stage 1
 

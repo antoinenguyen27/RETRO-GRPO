@@ -34,7 +34,8 @@ For each prompt in the batch:
 
 1. Generate 4 unconditioned scout rollouts.
 2. Score them with deterministic answer verification.
-3. Summarise the failed scout attempts from that scout set.
+3. Summarise the failed scout attempts from that scout set, then aggregate
+   those descriptions into one summary.
 4. Prepend the descriptive summary to the prompt.
 5. Generate 4 conditioned rollouts.
 6. Train on the conditioned rollouts only.
@@ -216,7 +217,7 @@ stage1_config = {
     "num_generations": 4,
     "effective_batch_size": 12,
     "optimizer_steps": 300,
-    "max_completion_length": 512,
+    "max_completion_length": 1024,
     "temperature": 1.0,
     "learning_rate": 5e-6,
     "beta": 0.001,
@@ -228,9 +229,9 @@ stage1_config = {
 ```
 
 Notes:
-- `max_completion_length = 512` remains the default budget-conscious choice.
+- `max_completion_length = 1024` is the stage-1 rollout budget.
 - `num_generations = 4` is retained as the main budget lever.
-- The in-step two-phase pipeline remains the default.
+- The in-step two-phase pipeline with hierarchical summarisation remains the default.
 
 ---
 
@@ -244,21 +245,23 @@ For a generation batch of `B` prompts:
 
 1. batched scout generation,
 2. batched scout scoring,
-3. build summariser prompts for every prompt using the failed scouts from that prompt's scout set,
-4. run summarisation,
-5. batched conditioned generation for every prompt in the batch,
-6. assemble the final training batch,
-7. standard GRPO loss and update.
+3. build first-pass summariser prompts for the failed scouts from each prompt's scout set,
+4. run first-pass summarisation,
+5. build aggregate summariser prompts for every prompt,
+6. run aggregate summarisation,
+7. batched conditioned generation for every prompt in the batch,
+8. assemble the final training batch,
+9. standard GRPO loss and update.
 
 ### Memory handling
 
-Scouts do **not** need to be retained once they have been scored and, where relevant, converted into summary input. This keeps the memory profile close to standard GRPO, aside from the extra sequential generation calls.
+Scouts do **not** need to be retained once they have been scored and, where relevant, converted into rollout summaries. This keeps the memory profile close to standard GRPO, aside from the extra sequential summarisation calls.
 
 ### Summaries
 
 Summaries stay:
 - descriptive,
-- short,
+- detailed enough to preserve approach structure,
 - non-prescriptive,
 - non-evaluative.
 

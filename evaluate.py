@@ -111,7 +111,7 @@ def evaluate(checkpoint: str = "/models/baseline_final", run_name: str = ""):
         with torch.no_grad():
             outputs = model.generate(
                 input_ids=input_ids,
-                max_new_tokens=512,
+                max_new_tokens=1024,
                 do_sample=False,
                 temperature=1.0,
             )
