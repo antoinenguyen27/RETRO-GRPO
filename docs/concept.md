@@ -132,22 +132,17 @@ The method modifies the rollout generation phase of standard GRPO training using
    - Generate N rollouts from π_θ(y|x) (unconditioned)
    - Compute rewards for scouts
 
-3. Assess:
-   - If scout solve rate > τ: skip conditioning, apply standard GRPO to
-     scout rollouts directly (they become the training rollouts) → done
-   - If scout solve rate ≤ τ: trigger summarisation
-
-4. Summarise (synchronous, in-step):
-   - Feed all failed scout rollouts to the summariser in a single call
+3. Summarise (synchronous, in-step):
+   - Feed the failed scout rollouts to the summariser in a single call
    - Summariser produces a single narrative summary (3-5 sentences) of
      approaches tried and how they ended up
    - Wrap summary in a randomly selected framing template
 
-5. Conditioned rollouts:
+4. Conditioned rollouts:
    - Generate N rollouts from π_θ(y|x, c) where c is the failure context block
    - Compute rewards
 
-6. GRPO update:
+5. GRPO update:
    - Compute advantages across the N conditioned rollouts ONLY
    - Scouts are excluded from the gradient computation (they served as
      diagnostic input for the summariser)
@@ -157,7 +152,7 @@ The method modifies the rollout generation phase of standard GRPO training using
 
 **Note on scout exclusion from gradient:** This is a deliberate hard-problem tradeoff, not a claim of universal superiority. On prompts where scouts are overwhelmingly failures, their advantages are near-degenerate and their gradient contribution is usually negligible. Excluding them concentrates gradient budget on the conditioned rollouts, where informative discoveries are more likely. The cost is that we do not get the implicit anti-dependence benefit of joint unconditioned+conditioned gradient on those prompts. Annealing therefore does essential work in our method: it is the mechanism that reintroduces unconditioned training signal once the prompt begins to crack. We test this tradeoff directly with a scout-excluded vs. scout-included ablation.
 
-**Note on step 3 early exit:** If the scouts reveal the prompt is above threshold (the model has improved since the solve rate was last computed), we skip conditioning entirely and use the scouts as standard GRPO training rollouts. No compute is wasted — the scouts serve double duty as both assessment and training data.
+**Stage-1 note:** In the proof-of-concept stage, we do **not** use scout-success gating. Once a prompt is routed into the RETRO-GRPO path, it proceeds through summarisation and conditioned rollout generation without an additional early-exit shortcut. That keeps the first experiment focused on testing the conditioned mechanism directly before introducing routing heuristics.
 
 ### 4.3 The Summariser
 
@@ -233,32 +228,29 @@ The model reads the failure context before it encounters the problem, so the con
 
 ### 4.5 Annealing
 
-**Role of annealing:** Annealing is not merely a graceful way to withdraw a training aid. In our default design, when conditioning triggers, the prompt receives gradient only through conditioned rollouts. On persistently hard prompts, that means the model may go many updates without directly practising unconditioned generation on that prompt at all. Annealing is therefore the mechanism that transitions learning back into the unconditioned distribution. It is structurally necessary, not optional polish.
+**Role of annealing:** Annealing remains the mechanism that transfers gains from the more capable conditioned policy back into the unconditioned policy. That conceptual role is unchanged.
 
-**Mechanism:** Appearance probability annealing (the conditioning either appears in full or not at all). We do not anneal summary detail, which would introduce a novel distribution of conditioning text mid-training and add noise.
+**However, it is no longer the first experiment.** The experimental program is staged:
 
-**Schedule:** Per-prompt, self-calibrating, gated on performance.
+1. **Stage 1:** validate uplift from descriptive failure-conditioning with **no annealing**.
+2. **Stage 2:** add **batch-consistent annealing** using a global EMA-governed conditioning rate.
+3. **Stage 3:** add the **per-prompt coin-flip** annealing variant.
+
+This ordering is deliberate. There is no value in optimising annealing before showing that summary-conditioned rollouts improve training at all.
+
+**Full-method schedule (research default):** Performance-gated appearance annealing remains the intended long-horizon mechanism once the base effect is validated.
 
 ```
 p_condition(x) = max(0, 1 - (solve_rate(x) / τ))
 ```
 
-Where solve_rate(x) is a rolling average over the last K appearances of prompt x (K ≈ 5-10). τ is the solve-rate threshold (hyperparameter, suggested 0.25-0.5).
+Where solve_rate(x) is a rolling average over the last K appearances of prompt x and τ is the solve-rate threshold.
 
-When solve_rate = 0 (never solved): p_condition = 1 (always conditioned).
-When solve_rate = τ (solving at target rate): p_condition = 0 (conditioning fully withdrawn).
-Linear interpolation between.
+**Stage-2 operational schedule:** use a **global EMA of performance** to set the conditioning rate, and apply that decision with **batch consistency**. Either the whole batch uses the conditioning path or the whole batch runs standard GRPO.
 
-**Key property: performance-gated, not step-gated.** The conditioning stays at full strength as long as the model is struggling on a prompt. It only recedes when the model demonstrates actual improvement on that specific prompt. This means:
+**Stage-3 operational schedule:** keep the global EMA-governed conditioning rate, but make the decision at the prompt level via a coin flip. This tests whether mixed conditioned/unconditioned prompts within the same batch improve internalisation enough to justify the extra throughput cost.
 
-- A prompt that remains hard throughout training keeps full conditioning throughout.
-- A prompt that cracks quickly begins receiving unconditioned practice quickly.
-- There is no global schedule to tune. The per-prompt solve rate is the only signal.
-- The schedule explicitly manages the return path from a more capable conditioned policy to the unconditioned policy we care about at inference time.
-
-Another way to view the schedule is as a controlled handoff. Early in training, the conditioned policy is allowed to do the exploration-heavy work. As soon as the prompt becomes tractable, the annealing coin flips begin reintroducing unconditioned rollouts, so the model must demonstrate that the improvement has transferred into its weights rather than remaining contingent on the context block.
-
-**Experimental knob:** Detail annealing (instructing the summariser to produce shorter/vaguer summaries as solve rate improves) is a secondary axis that can be explored but is NOT the default. Appearance annealing is cleaner and avoids managing multiple summariser prompt variants.
+We still prefer **appearance annealing** over detail annealing. We do not anneal summary content itself.
 
 ### 4.6 Anti-Dependence Mechanisms
 
@@ -297,103 +289,128 @@ This ablation is particularly informative on τ-bench, where the agentic transfe
 
 ## 5. Benchmarks
 
-### 5.1 Primary: Mathematical Reasoning (Hard)
+### 5.1 Research-Level Benchmark Positioning
 
-**AIME 2025** (30 problems, olympiad-level, integer answers 000-999). The standard comparison point. Every paper in this space reports it (iGRPO, Critique-GRPO, POPE, PrefixRL, NSR). Required for positioning.
+For full-scale evaluation and paper positioning, the method remains naturally relevant to hard mathematical reasoning benchmarks and later to hard agentic benchmarks.
 
-**OlymMATH-HARD** (olympiad-level, specifically designed to resist shortcut strategies). Even frontier models achieve only 30-60%. For 7B models under RL training, the majority of these problems will be in the low-solve-rate regime where our method has maximum leverage.
+Mathematical benchmarks of interest remain:
+- AIME-style competition math,
+- OlymMATH-HARD,
+- HMMT-style hard competition sets,
+- MATH-style benchmark suites.
 
-**HMMT 2025** (competition mathematics). Used by POPE specifically because it's in the zero-reward regime for most models. Direct comparison point for the hard-problem exploration argument.
+Agentic benchmarks such as τ-bench remain a natural later-stage extension once the core math mechanism is validated.
 
-### 5.2 Secondary: Agentic (Hard, Unsaturated)
+### 5.2 Proof-of-Concept Benchmark Choice
 
-**τ-bench retail** (multi-turn customer service with API tool calls and policy guidelines). GPT-4o succeeds on <50% of tasks with pass^8 <25%. Key properties that make it suitable:
+For the compute-constrained PoC, the benchmark plan is deliberately narrower.
 
-- Failure modes are structured and recurring (wrong tool, policy violation, missing verification). Naturally summarisable.
-- The pass^k metric directly tests the exploration-preservation argument.
-- Far from saturated — large room for improvement.
-- Verifiable evaluation via database state comparison (no LLM judge needed for reward).
+**Stage 1 uses a single benchmark: MATH-500.**
 
-**Adaptation for agentic setting:** A "rollout" is a full multi-turn conversation. The summariser describes the sequence of actions taken across failed conversations. The failure context block is prepended to the agent's system prompt before the conversation begins. The GRPO update operates on the full trajectory reward.
+Why:
+- it is hard enough for conditioning to matter,
+- it is much more stable than tiny extreme-hard sets when used as the only benchmark,
+- it is simple to score deterministically,
+- it gives a cleaner first answer to the question "does the method help training on hard math at all?"
 
-The in-step vs post-step ablation is particularly informative on τ-bench due to faster transfer dynamics and combinatorially expanding failure frontiers as the model reaches new capability levels.
+**Reporting for stage 1:**
+- overall MATH-500,
+- plus a headline hard slice within MATH-500.
+
+GSM8K is not part of the core stage-1 evidence package, and AIME is not used as the sole first benchmark because it is too small and noisy for the first proof experiment.
 
 ### 5.3 Evaluation Metrics
 
-**Pass@k curves** (k = 1, 4, 16, 64, 256). The primary evidence. Pass@1 demonstrates convergence speed. Pass@k at large k demonstrates exploration preservation. The method should improve pass@1 without degrading pass@k relative to baselines.
+The primary early metric remains the learning curve on hard problems.
 
-**Learning curves.** Plot solve rate vs. training step for hard problems specifically (problems where the base model has pass@128 < 0.1). This shows the acceleration effect directly.
+For the PoC, that means:
+- solve rate vs training step on MATH-500,
+- hard-slice solve rate vs training step,
+- pass@1 and pass@4 where budget permits.
 
-**Conditioned vs. unconditioned gap over training.** Demonstrates that the model is internalising the failure-avoidance, not depending on context. This gap should shrink over training.
-
-### 5.4 Baselines
-
-1. **Standard GRPO** (primary baseline — full positive and negative advantage)
-2. **iGRPO** (positive self-conditioning via best draft)
-3. **Critique-GRPO** (natural language critique + refinement)
-4. **NSR-weighted REINFORCE** (upweighted negative sample reinforcement)
-5. **GRPO + our method** (the proposed method)
-
-Ablation conditions:
-- Hard prescriptive framing vs. soft descriptive framing (isolates framing contribution)
-- In-step vs. post-step summarisation (isolates freshness contribution)
-- Training policy summariser vs. frozen base summariser (isolates distributional alignment contribution)
-- Scout-excluded vs. scout-included gradient (tests whether joint gradient materially improves transfer or reduces dependence on medium-difficulty prompts)
-- PSR-only + our method (full decoupling — no negative gradient, all failure signal through context)
-- Detail annealing vs. appearance annealing
-
-### 5.5 Base Models
-
-**Qwen2.5-7B-Instruct** or **Qwen3-8B** to match iGRPO and Critique-GRPO baselines. These are the standard models in the current literature and enable direct comparison.
-
----
+Deterministic answer verification is the default evaluation path; no LLM judge is required for the stage-1 math setup.
 
 ## 6. Training Configuration
 
-### 6.1 GRPO Hyperparameters
+### 6.1 Research Configuration vs PoC Configuration
 
-Follow standard settings from the baseline papers:
-- Rollouts per phase: N = 8 (8 scouts, 8 conditioned when conditioning triggers)
-- Temperature: 1.0 for rollout generation
-- Learning rate: 1e-6
-- KL penalty coefficient: 0.001
-- Clipping epsilon: 0.2
-- Max response length: 2048 tokens (math), 4096 tokens (agentic)
-- Batch size: 64-256 prompts per step
+The original research configuration assumes larger benchmark suites, larger models, and more extensive ablations. The PoC configuration is intentionally narrower and budget-driven.
 
-### 6.2 Conditioning Hyperparameters
+### 6.2 PoC Default Configuration
 
-- Solve-rate threshold τ: 0.25 (suggested, tune on validation)
-- Rolling window for solve rate K: 5 appearances
-- Scout-to-conditioned ratio: 1:1 (N scouts, N conditioned)
-- Summariser mode: `training_policy` (default) or `frozen_base` (ablation)
-- Pipeline mode: `in_step` (default) or `post_step` (ablation)
-- Context block framing variants: 4-5 (randomly selected per prompt per step)
+**Model and stack**
+- Qwen3.5-4B
+- bf16 LoRA via Unsloth
+- LoRA rank 32
+- L4 as the default Modal GPU
 
-**Note on total rollout budget:** When conditioning triggers, the total per-prompt rollout count is 2N (N scouts + N conditioned). When conditioning does not trigger (prompt above threshold or annealing coin flip says skip), the total is N (standard GRPO). The overhead from 2N rollouts applies only to prompts below the solve-rate threshold, and the fraction of such prompts decreases over training as the model improves.
+**Training data**
+- DeepMath-103K
+- hard-filtered subset for stage 1
+- exact stage-1 subset size: 1,200 problems
+- filtering target: keep prompts in the hard-problem regime, operationally around pass@4 ≤ 0.25
 
-### 6.3 Training Data
+**Benchmark**
+- stage 1: MATH-500 only
 
-**Math:** OpenR1-Math-220k subsets (4k-32k prompts), matching Critique-GRPO's setup for direct comparison.
+**Generation and batching**
+- rollouts per phase: N = 4
+- max completion length: 512 tokens
+- effective batch size: 12
+- target unique prompts per generation cycle: 3
+- stage-1 optimizer steps: 300 (1,200 problems × 3 epochs / batch 12)
 
-**Agentic:** τ-bench task set with programmatic task generation for training scale.
+**Pipeline**
+- in-step two-phase generation
+- training-policy summariser
+- framing randomisation retained
+- no annealing in stage 1
 
----
+### 6.3 Stage-Specific Defaults
+
+**Stage 1**
+- baseline GRPO vs RETRO-GRPO
+- no annealing
+- hard-filtered broad training subset
+- objective: validate uplift from descriptive failure-conditioning
+
+**Stage 2**
+- add batch-consistent annealing via global EMA
+
+**Stage 3**
+- add per-prompt coin-flip annealing
+
+### 6.4 Operational Note on Cost
+
+Budget planning must account for GPU, CPU, and memory costs together. Because actual throughput depends heavily on rollout lengths and the fraction of prompts taking the conditioned branch, wall-clock projections should be treated as smoke-test validated rather than fixed analytically.
 
 ## 7. Implementation Complexity
 
-The method adds to a standard GRPO training loop:
-- A per-prompt solve-rate tracker (dictionary: prompt_id → list of recent solve rates)
-- A coin flip per prompt per batch (one line)
-- A two-phase rollout generation for conditioned prompts (following iGRPO's pattern)
-- A summariser call between phases (single inference call, same model, same GPU)
-- A string concatenation and prepend (trivial)
+The implementation burden depends on the stage.
 
-No changes to the GRPO algorithm, advantage computation, gradient update, or training infrastructure. The summariser uses the training policy (default) or base model with LoRA adapters toggled — either way, it's the same model already loaded on the same GPU. No additional model loading, no external API calls.
+### 7.1 Stage 1 Complexity
 
-Total additional code beyond standard GRPO: approximately 200-300 lines. The two-phase rollout structure follows iGRPO's pattern, which is already implemented in frameworks like VeRL.
+Stage 1 is intentionally simpler than the full method:
+- no annealing state,
+- no per-prompt solve-rate tracker,
+- no EMA schedule,
+- no coin flips.
 
----
+The added logic is:
+- batched scout generation,
+- deterministic scout scoring,
+- summarisation for every prompt routed into the RETRO-GRPO path using that prompt's failed scouts,
+- batched conditioned rollout generation for those prompts,
+- batch assembly before the standard GRPO update.
+
+This is the minimal implementation needed to answer the first-order mechanism question.
+
+### 7.2 Later-Stage Complexity
+
+Stage 2 adds a global EMA-governed annealing schedule with batch consistency.
+Stage 3 adds per-prompt routing on top of the global schedule.
+
+This staged implementation path is intentional: it keeps the first experiment simple and only adds schedule-management logic after the base uplift is established.
 
 ## 8. Key Risks and Mitigations
 

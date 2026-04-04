@@ -34,13 +34,12 @@ For each prompt in the batch:
 
 1. Generate 4 unconditioned scout rollouts.
 2. Score them with deterministic answer verification.
-3. If **any** scout succeeds, use the scout rollouts directly as the training rollouts.
-4. If **all** scouts fail, summarise the failed attempts.
-5. Prepend the descriptive summary to the prompt.
-6. Generate 4 conditioned rollouts.
-7. Train on the conditioned rollouts only.
+3. Summarise the failed scout attempts from that scout set.
+4. Prepend the descriptive summary to the prompt.
+5. Generate 4 conditioned rollouts.
+6. Train on the conditioned rollouts only.
 
-The "any scout succeeds" branch is an **efficiency shortcut**, not annealing.
+Stage 1 does **not** use scout-success gating. The stage-1 RETRO-GRPO path always proceeds through summarisation and conditioned rollout generation; the point is to test the conditioned mechanism directly before adding annealing or routing shortcuts.
 
 ---
 
@@ -245,9 +244,9 @@ For a generation batch of `B` prompts:
 
 1. batched scout generation,
 2. batched scout scoring,
-3. build summariser prompts only for all-failed prompts,
+3. build summariser prompts for every prompt using the failed scouts from that prompt's scout set,
 4. run summarisation,
-5. batched conditioned generation for those prompts,
+5. batched conditioned generation for every prompt in the batch,
 6. assemble the final training batch,
 7. standard GRPO loss and update.
 
@@ -329,6 +328,36 @@ Because true throughput depends on:
 we should treat wall-clock estimates as **smoke-test validated**, not fixed on paper.
 
 The exact-stage-1 dataset size of **1,200** is chosen partly to create budget headroom for that uncertainty.
+
+---
+
+## 11A. Telemetry
+
+Telemetry for all stages uses **Weights & Biases (W&B) only**. It is the single experiment-tracking backend and system of record for configs, metrics, and run comparisons.
+
+The setup should remain simple and consistent across runs:
+- one W&B project for the PoC,
+- separate run names / tags for `baseline_grpo` and `retro_grpo`,
+- stage labels recorded in config,
+- no separate tracking stack in parallel.
+
+### What to log
+
+Log the usual trainer metrics plus the method-specific signals that matter for comparison:
+- run config and experiment tag,
+- code version / commit hash if available,
+- reward statistics,
+- loss / KL / clipping metrics,
+- step time and throughput,
+- GPU memory and utilization if available,
+- evaluation scores on the fixed MATH-500 subset.
+
+For RETRO-GRPO specifically, also log:
+- scout solve rate,
+- conditioned rollout solve rate,
+- scheduled conditioning rate.
+
+For stage 1, the scheduled conditioning rate for RETRO-GRPO is simply **1.0** because there is no annealing and no scout-success routing. For baseline GRPO, conditioning metrics can be omitted or logged as `0.0` / `N/A` consistently.
 
 ---
 
