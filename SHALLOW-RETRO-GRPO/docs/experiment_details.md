@@ -93,11 +93,11 @@ This is the default operational model for the PoC. We do not discuss fallback mo
 
 **Modal L40S** by default.
 
-The current operational default uses **L40S** so the stage-1 runtime can support the larger physical microbatch and the long-sequence GRPO logprob path with headroom.
+The current operational default uses **L40S** so the stage-1 runtime can support the 8B trainer, the long-sequence GRPO logprob path, and the split backward update path with headroom.
 
 Reasoning:
 - single-GPU operation keeps the custom trainer simple,
-- the L40S gives enough VRAM headroom for the current 8B trainer and `6x2` batch layout,
+- the L40S gives enough VRAM headroom for the current 8B trainer and `4x3` rollout layout with update microbatching,
 - it preserves room for longer completions and follow-on batch experiments.
 
 ### Framework
@@ -185,15 +185,17 @@ Batch size must be treated explicitly in GRPO.
 
 ### Default stage-1 batching
 
-- `per_device_train_batch_size = 6`
-- `gradient_accumulation_steps = 2`
+- `per_device_train_batch_size = 4`
+- `gradient_accumulation_steps = 3`
 - `num_generations = 4`
+- `update_prompt_microbatch_size = 2`
 - **effective prompt batch size = 12**
 - **effective conditioned completions per optimizer step = 48**
-- target unique prompts per generation cycle: **6**
+- target unique prompts per generation cycle: **4**
+- target prompts per backward subchunk: **2**
 
-This keeps the effective prompt batch in the same regime while reducing accumulation overhead.
-The key accounting unit is prompt groups, not repeated prompt slots. Each microbatch contains `6` prompt groups and `4` rollouts per prompt. Gradient accumulation over `2` microbatches yields `12` prompt groups per optimizer step.
+This keeps the effective prompt batch in the same regime while keeping the backward pass smaller than the rollout batch.
+The key accounting unit is prompt groups, not repeated prompt slots. Each rollout microbatch contains `4` prompt groups and `4` rollouts per prompt. Gradient accumulation over `3` microbatches yields `12` prompt groups per optimizer step. The update pass is then split into `2 prompt x 4 rollout = 8 sequence` backward subchunks.
 
 ### Stage-1 optimizer-step count
 
@@ -222,9 +224,10 @@ stage1_config = {
     "dataset": "DeepMath-103K_hard_filtered_1200",
     "epochs": 3,
     "benchmark": "MATH-500",
-    "per_device_train_batch_size": 6,
-    "gradient_accumulation_steps": 2,
+    "per_device_train_batch_size": 4,
+    "gradient_accumulation_steps": 3,
     "num_generations": 4,
+    "update_prompt_microbatch_size": 2,
     "effective_prompt_batch_size": 12,
     "effective_conditioned_completions": 48,
     "optimizer_steps": 300,

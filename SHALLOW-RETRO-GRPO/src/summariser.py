@@ -4,8 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from src.token_utils import truncate_from_left
-
+from .token_utils import truncate_from_left
 
 SUMMARISER_SYSTEM_PROMPT = "You are a careful summariser."
 
@@ -230,7 +229,9 @@ def generate_summary(
     summaries = generate_failure_summaries(
         model=model,
         tokenizer=tokenizer,
-        requests=[FailureSummaryRequest(question=question, failed_rollouts=failed_rollouts)],
+        requests=[
+            FailureSummaryRequest(question=question, failed_rollouts=failed_rollouts)
+        ],
         rollout_summary_max_new_tokens=rollout_summary_max_new_tokens,
         aggregate_summary_max_new_tokens=aggregate_summary_max_new_tokens,
         enable_thinking=enable_thinking,

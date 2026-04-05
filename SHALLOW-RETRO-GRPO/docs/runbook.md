@@ -103,9 +103,10 @@ modal run train.py --mode retro
 
 These use the defaults from [src/config.py](/Users/an/Documents/RETRO-GRPO/src/config.py):
 - `gpu = "L40S"`
-- `per_device_train_batch_size = 6`
-- `gradient_accumulation_steps = 2`
+- `per_device_train_batch_size = 4`
+- `gradient_accumulation_steps = 3`
 - `num_generations = 4`
+- `update_prompt_microbatch_size = 2`
 - `num_train_epochs = 3`
 - `beta = 0.0`
 - `scale_rewards = "group"`
@@ -178,9 +179,12 @@ RETRO runs should additionally log:
 If the smoke test fails, check these first.
 
 If you hit OOM:
-- fall back from `6x2` to `4x3` in [src/config.py](/Users/an/Documents/RETRO-GRPO/src/config.py)
+- first reduce `per_device_train_batch_size` or increase `gradient_accumulation_steps` in [src/config.py](/Users/an/Documents/RETRO-GRPO/src/config.py)
+- keep `update_prompt_microbatch_size = 2` so the update pass stays split into smaller backward chunks
+- if `4x3` still fails, reduce `max_completion_length`
 
 If throughput is too slow:
+- if `4x3` is stable, try `6x2` while keeping `update_prompt_microbatch_size = 2`
 - reduce `max_completion_length`
 - reduce `rollout_summary_max_new_tokens`
 - reduce `aggregate_summary_max_new_tokens`

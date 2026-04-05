@@ -49,6 +49,7 @@ class Stage1Config:
     scale_rewards: str = "group"
     loss_type: str = "dapo"
     mask_truncated_completions: bool = False
+    update_prompt_microbatch_size: int = 2
 
     # Rollout budgets
     max_completion_length: int = 1024

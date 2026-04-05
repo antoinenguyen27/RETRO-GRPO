@@ -1,6 +1,7 @@
 """Custom rollout engines for baseline GRPO and RETRO-GRPO."""
 
 from dataclasses import dataclass, field
+from time import perf_counter
 
 import torch
 
@@ -25,6 +26,12 @@ class RolloutBatch:
     group_ids: list[int]
     truncated: list[bool]
     metrics: dict[str, float] = field(default_factory=dict)
+
+
+def _synchronize_model_device(model) -> None:
+    device = getattr(model, "device", None)
+    if isinstance(device, torch.device) and device.type == "cuda":
+        torch.cuda.synchronize(device)
 
 
 def _trim_completion_ids(
@@ -52,6 +59,7 @@ def _generate_policy_rollouts(
     config: Stage1Config,
     label: str,
 ) -> RolloutBatch:
+    tokenize_start = perf_counter()
     max_prompt_tokens = max(config.max_seq_length - config.max_completion_length, 1)
     prompt_token_lists = [
         truncate_from_left(
@@ -77,7 +85,10 @@ def _generate_policy_rollouts(
     expanded_attention_mask = model_inputs["attention_mask"].repeat_interleave(
         config.num_generations, dim=0
     )
+    tokenize_s = perf_counter() - tokenize_start
 
+    _synchronize_model_device(model)
+    generate_start = perf_counter()
     outputs = model.generate(
         input_ids=expanded_input_ids,
         attention_mask=expanded_attention_mask,
@@ -90,7 +101,10 @@ def _generate_policy_rollouts(
         pad_token_id=tokenizer.pad_token_id,
         eos_token_id=tokenizer.eos_token_id,
     )
+    _synchronize_model_device(model)
+    generate_s = perf_counter() - generate_start
 
+    postprocess_start = perf_counter()
     padded_prompt_length = expanded_input_ids.shape[1]
     sequences: list[list[int]] = []
     prompt_lengths: list[int] = []
@@ -117,16 +131,31 @@ def _generate_policy_rollouts(
         )
         group_ids.append(prompt_idx)
         truncated.append(is_truncated)
+    postprocess_s = perf_counter() - postprocess_start
 
+    reward_start = perf_counter()
     repeated_answers = [answers[group_id] for group_id in group_ids]
     rewards = score_completion_texts(completion_texts, repeated_answers)
+    reward_s = perf_counter() - reward_start
+
     completion_lengths = [len(ids) for ids in completion_ids]
+    prompt_token_counts = prompt_lengths
+    sequence_lengths = [prompt + completion for prompt, completion in zip(prompt_lengths, completion_lengths)]
 
     metrics = {
         f"{label}_correct": float(sum(rewards)),
         f"{label}_count": float(len(rewards)),
         f"{label}_truncated": float(sum(1 for item in truncated if item)),
+        f"{label}_tokenize_s": tokenize_s,
+        f"{label}_generate_s": generate_s,
+        f"{label}_postprocess_s": postprocess_s,
+        f"{label}_reward_s": reward_s,
+        f"{label}_prompt_tokens": float(sum(prompt_token_counts)),
+        f"{label}_prompt_tokens_max": float(max(prompt_token_counts)) if prompt_token_counts else 0.0,
         f"{label}_completion_tokens": float(sum(completion_lengths)),
+        f"{label}_completion_tokens_max": float(max(completion_lengths)) if completion_lengths else 0.0,
+        f"{label}_sequence_tokens": float(sum(sequence_lengths)),
+        f"{label}_sequence_tokens_max": float(max(sequence_lengths)) if sequence_lengths else 0.0,
     }
 
     return RolloutBatch(
@@ -196,6 +225,8 @@ def run_retro_rollouts(
             )
         )
 
+    _synchronize_model_device(model)
+    summary_start = perf_counter()
     summaries = generate_failure_summaries(
         model=model,
         tokenizer=tokenizer,
@@ -207,6 +238,18 @@ def run_retro_rollouts(
         summariser_mode=config.summariser_mode,
         max_seq_length=config.max_seq_length,
     )
+    _synchronize_model_device(model)
+    summary_generate_s = perf_counter() - summary_start
+
+    non_empty_summaries = [summary for summary in summaries if summary]
+    summary_token_lengths = []
+    if non_empty_summaries:
+        summary_token_lengths = [
+            len(token_ids)
+            for token_ids in tokenizer(
+                non_empty_summaries, add_special_tokens=False
+            ).input_ids
+        ]
 
     conditioned_messages_batch: list[list[dict]] = []
     conditioned_prompt_count = 0
@@ -228,6 +271,15 @@ def run_retro_rollouts(
         label="retro_conditioned",
     )
     conditioned_batch.metrics.update(scout_batch.metrics)
+    conditioned_batch.metrics["retro_failed_rollout_count"] = float(
+        sum(len(request.failed_rollouts) for request in requests)
+    )
+    conditioned_batch.metrics["retro_summary_generate_s"] = summary_generate_s
+    conditioned_batch.metrics["retro_summary_count"] = float(len(non_empty_summaries))
+    conditioned_batch.metrics["retro_summary_tokens"] = float(sum(summary_token_lengths))
+    conditioned_batch.metrics["retro_summary_tokens_max"] = (
+        float(max(summary_token_lengths)) if summary_token_lengths else 0.0
+    )
     conditioned_batch.metrics["retro_summary_prompt_count"] = float(
         conditioned_prompt_count
     )

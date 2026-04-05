@@ -123,6 +123,19 @@ How many microbatches we process before one optimizer update.
 
 If `gradient_accumulation_steps = 2`, then we process 2 microbatches and then call `optimizer.step()`.
 
+### Update microbatch
+
+The update microbatch is a backward-only subchunk inside one prepared rollout batch.
+
+It is controlled by `update_prompt_microbatch_size` in [src/config.py](/Users/an/Documents/RETRO-GRPO/src/config.py).
+
+If `update_prompt_microbatch_size = 2` and `num_generations = 4`, then each backward subchunk contains:
+
+- 2 prompt groups
+- 8 rollout sequences
+
+This does not change rollout collection. It only changes how the update pass is sliced for memory.
+
 ### Optimizer step
 
 One full GRPO update cycle:
@@ -131,7 +144,7 @@ One full GRPO update cycle:
 - generate rollouts for each microbatch
 - compute `old_logprobs`
 - compute rewards and advantages
-- run the update pass
+- run the update pass, optionally split into update microbatches
 - call `optimizer.step()`
 
 ## What `6x2` Means
@@ -160,11 +173,12 @@ Important:
 The current default runtime in [src/config.py](/Users/an/Documents/RETRO-GRPO/src/config.py) is:
 
 - `gpu = "L40S"`
-- `per_device_train_batch_size = 6`
-- `gradient_accumulation_steps = 2`
+- `per_device_train_batch_size = 4`
+- `gradient_accumulation_steps = 3`
 - `num_generations = 4`
+- `update_prompt_microbatch_size = 2`
 
-This keeps the effective prompt batch at 12 while reducing accumulation overhead relative to the older `3x4` plan.
+This keeps the effective prompt batch at 12, while the update pass itself runs in smaller `2 prompts x 4 rollouts = 8 sequence` backward chunks.
 
 ## Supported Layouts
 
@@ -181,6 +195,20 @@ How to read this table:
 - If the effective prompt batch stays at 12, the training budget stays the same and only the packing changes.
 - If the effective prompt batch increases to 16 or 20, the default epoch-based training loop automatically reduces optimizer steps.
 
+## Update Microbatching
+
+The rollout batch and the update microbatch are independent knobs.
+
+Example with the current default:
+
+- rollout layout: `4x3`
+- each physical rollout microbatch: 4 prompts, 16 rollout sequences
+- backward layout: `2 prompts x 4 rollouts = 8 sequences`
+
+This means the model still collects the same rollouts and keeps the same optimizer-step budget, but backward no longer has to carry the full physical rollout batch at once.
+
+This is specifically useful when the trainer OOMs in `loss.backward()` rather than in rollout generation or old-logprob preparation.
+
 ## Which Layout To Use
 
 ### `3x4`
@@ -195,7 +223,7 @@ Use this when you want the safest apples-to-apples improvement over `3x4`.
 
 Use this when you want the same effective prompt batch as `3x4`, but with better throughput on a GPU that can fit the larger physical microbatch.
 
-This is the best default if memory headroom is available.
+Use this only after confirming that the update microbatching path gives enough headroom.
 
 ### `4x4`
 
@@ -211,6 +239,7 @@ Edit these fields in [src/config.py](/Users/an/Documents/RETRO-GRPO/src/config.p
 
 - `per_device_train_batch_size`
 - `gradient_accumulation_steps`
+- `update_prompt_microbatch_size`
 - keep `num_generations = 4` unless you intentionally want to change GRPO grouping
 
 The trainer computes total optimizer steps from:
@@ -225,15 +254,16 @@ That logic lives in [src/trainer.py](/Users/an/Documents/RETRO-GRPO/src/trainer.
 
 ## Memory Intuition
 
-Accumulation is sequential in this trainer.
+Accumulation is sequential in this trainer, and update microbatching is sequential inside the backward pass.
 
-That means a `6x2` run does not hold 48 rollout sequences live at once. The expensive forward/backward peak is dominated by one physical microbatch, which is 24 sequences for `6x2`.
+That means a `6x2` run does not hold 48 rollout sequences live at once. The expensive forward/backward peak is dominated first by one physical rollout microbatch, then by the current update microbatch.
 
 So:
 
 - `3x4` peaks like 12 live sequences
 - `4x3` peaks like 16 live sequences
 - `6x2` peaks like 24 live sequences
+- with `update_prompt_microbatch_size = 2`, backward peaks like 8 live sequences for the update pass
 
 The main benefit of moving from `3x4` to `6x2` is:
 
@@ -250,8 +280,9 @@ The main cost is:
 For the current single-GPU Modal runtime:
 
 - keep `num_generations = 4`
-- use `6x2` when the GPU fits it comfortably
-- fall back to `4x3` if `6x2` is too tight
+- use update microbatching to keep backward chunks at 2 prompts
+- start from `4x3`
+- try `6x2` only if `4x3` has comfortable headroom
 
 If you change the batch layout, remember to compare runs using the right unit:
 
