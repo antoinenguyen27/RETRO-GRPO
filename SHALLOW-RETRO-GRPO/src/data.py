@@ -1,9 +1,11 @@
 from datasets import load_dataset, Dataset
 
-from src.config import SYSTEM_PROMPT
+from src.config import STAGE1_CONFIG, SYSTEM_PROMPT
 
 
-def filter_hard_problems(dataset: Dataset, n: int = 1200) -> Dataset:
+def filter_hard_problems(
+    dataset: Dataset, n: int = STAGE1_CONFIG.dataset_subset_size
+) -> Dataset:
     """Sort DeepMath-103K by difficulty descending and take the top n problems."""
     sorted_ds = dataset.sort("difficulty", reverse=True)
     return sorted_ds.select(range(min(n, len(sorted_ds))))
@@ -39,7 +41,7 @@ def format_for_eval(example: dict) -> dict:
 def load_and_prepare_training_data(save_path: str | None = None) -> Dataset:
     """Load DeepMath-103K, filter to hard problems, format for training."""
     ds = load_dataset("zwhe99/DeepMath-103K", split="train")
-    ds = filter_hard_problems(ds, n=1200)
+    ds = filter_hard_problems(ds, n=STAGE1_CONFIG.dataset_subset_size)
     ds = ds.map(format_for_training, remove_columns=ds.column_names)
     if save_path:
         ds.save_to_disk(save_path)

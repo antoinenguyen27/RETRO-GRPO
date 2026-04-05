@@ -9,7 +9,7 @@ Entry points:
 
 import modal
 
-from .config import STAGE1_CONFIG, Stage1Config
+from src.config import STAGE1_CONFIG, Stage1Config
 
 app = modal.App("retro-grpo-train")
 
@@ -32,9 +32,9 @@ def _clone_config() -> Stage1Config:
 def _build_trainer(mode: str, run_name: str, output_dir: str):
     from datasets import load_from_disk
 
-    from .config import MODEL_DIR, TRAIN_DATA_DIR
-    from .modeling import load_trainable_policy
-    from .trainer import BaselineTrainer, RetroTrainer
+    from src.config import MODEL_DIR, TRAIN_DATA_DIR
+    from src.modeling import load_trainable_policy
+    from src.trainer import BaselineTrainer, RetroTrainer
 
     config = _clone_config()
     dataset = load_from_disk(TRAIN_DATA_DIR)
@@ -54,7 +54,7 @@ def _build_trainer(mode: str, run_name: str, output_dir: str):
 
 
 def _save_final_checkpoint(trainer, path: str) -> None:
-    from .modeling import save_adapter_checkpoint
+    from src.modeling import save_adapter_checkpoint
 
     trainer.accelerator.wait_for_everyone()
     if trainer.accelerator.is_main_process:
@@ -113,9 +113,9 @@ def train_retro():
 def smoke_test(mode: str = "baseline", steps: int = 10):
     from datasets import load_from_disk
 
-    from .config import MODEL_DIR, TRAIN_DATA_DIR
-    from .modeling import load_trainable_policy
-    from .trainer import BaselineTrainer, RetroTrainer
+    from src.config import MODEL_DIR, TRAIN_DATA_DIR
+    from src.modeling import load_trainable_policy
+    from src.trainer import BaselineTrainer, RetroTrainer
 
     config = _clone_config()
     config.num_train_epochs = 1

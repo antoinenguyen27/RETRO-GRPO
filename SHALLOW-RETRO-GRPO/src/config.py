@@ -10,7 +10,7 @@ SYSTEM_PROMPT = (
 class Stage1Config:
     # Model
     model_name: str = "Qwen/Qwen3-8B"
-    max_seq_length: int = 2048
+    max_seq_length: int = 8192
     dtype: str = "bfloat16"
     lora_rank: int = 32
     lora_alpha: int = 32
@@ -29,14 +29,14 @@ class Stage1Config:
 
     # Data
     dataset_name: str = "zwhe99/DeepMath-103K"
-    dataset_subset_size: int = 1200
+    dataset_subset_size: int = 64
     benchmark_name: str = "HuggingFaceH4/MATH-500"
 
     # Optimisation
     num_generations: int = 4
     per_device_train_batch_size: int = 4
-    gradient_accumulation_steps: int = 3
-    num_train_epochs: int = 3
+    gradient_accumulation_steps: int = 2
+    num_train_epochs: int = 2
     learning_rate: float = 5e-6
     lr_scheduler_type: str = "linear"
     warmup_steps: int = 0
@@ -49,10 +49,10 @@ class Stage1Config:
     scale_rewards: str = "group"
     loss_type: str = "dapo"
     mask_truncated_completions: bool = False
-    update_prompt_microbatch_size: int = 2
+    update_prompt_microbatch_size: int = 1
 
     # Rollout budgets
-    max_completion_length: int = 1024
+    max_completion_length: int = 6144
     rollout_summary_max_new_tokens: int = 384
     aggregate_summary_max_new_tokens: int = 512
 
@@ -86,7 +86,7 @@ class Stage1Config:
     save_steps: int = 50
     save_total_limit: int = 3
     dataloader_num_workers: int = 0
-    gpu: str = "L40S"
+    gpu: str = "H100"
     wandb_project: str = "retro-grpo-poc"
 
     @property
@@ -104,5 +104,5 @@ STAGE1_CONFIG = Stage1Config()
 MODEL_VOLUME_PATH = "/models"
 DATA_VOLUME_PATH = "/data"
 MODEL_DIR = f"{MODEL_VOLUME_PATH}/Qwen3-8B"
-TRAIN_DATA_DIR = f"{DATA_VOLUME_PATH}/deepmath_hard_1200"
+TRAIN_DATA_DIR = f"{DATA_VOLUME_PATH}/deepmath_hard_{STAGE1_CONFIG.dataset_subset_size}"
 EVAL_DATA_DIR = f"{DATA_VOLUME_PATH}/math500"
